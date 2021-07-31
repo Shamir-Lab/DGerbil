@@ -49,13 +49,37 @@ class SequenceSplitter{
 
 	std::atomic<uint64> _baseNumbers;  // total number of bases
 
+
 	uint32_t invMMer(const uint32_t &mmer);    // inverts a minimizer
 	bool isAllowed(uint32 mmer);               // checks whether a minimizer is allowed (special, tested strategies)
 	void detMMerHisto();                       // calculation of a histogram (special, tested strategies)
+	void loadRanks(uint32* ranks);
+	void loadFrequency(uint32* freq);
 
 	void processThread(const uint &id);        // starts a single thread
 
 public:
+	class Comp
+	{
+		uint32* signature_occurrences;
+	public:
+		Comp(uint32* _signature_occurrences) : signature_occurrences(_signature_occurrences){}
+		bool operator()(int i, int j)
+		{
+			return signature_occurrences[i] > signature_occurrences[j];
+		}
+	};
+
+	class CompR
+	{
+		uint32* signature_occurrences;
+	public:
+		CompR(uint32* _signature_occurrences) : signature_occurrences(_signature_occurrences){}
+		bool operator()(int i, int j)
+		{
+			return signature_occurrences[i] < signature_occurrences[j];
+		}
+	};
     SyncSwapQueueMPSC<SuperBundle>** getSuperBundleQueues();    // returns the SuperBundleQueues
 
     /*

@@ -7,6 +7,9 @@
 
 
 #include "../../include/gerbil/SequenceSplitter.h"
+#include <iostream>
+#include <string>
+#include <fstream>
 
 
 #define SS_MMER_UNDEFINED 0x80000000
@@ -49,7 +52,6 @@ gerbil::SequenceSplitter::~SequenceSplitter() {
 gerbil::SyncSwapQueueMPSC<gerbil::SuperBundle>** gerbil::SequenceSplitter::getSuperBundleQueues() {
 	return _superBundleQueues;
 }
-
 uint32_t gerbil::SequenceSplitter::invMMer(const uint32_t &mmer){
 	uint32 rev = 0;
 	uint32 immer = ~mmer;
@@ -61,6 +63,7 @@ uint32_t gerbil::SequenceSplitter::invMMer(const uint32_t &mmer){
 	}
 	return rev;
 }
+
 
 // kmc2 strategy
 bool gerbil::SequenceSplitter::isAllowed(uint32 mmer) {
@@ -88,33 +91,186 @@ bool gerbil::SequenceSplitter::isAllowed(uint32 mmer) {
 	return true;
 }
 
+
+void gerbil::SequenceSplitter::loadRanks(uint32* ranks)
+{
+	uint32 mmersNumber = 1<<(2*_m);
+	uint32 localRanks[mmersNumber];
+	std::ifstream infile("ranks.txt");
+	int str_value;
+	std::string line;
+	uint32 i = 0;
+	while (std::getline(infile, line))
+	{
+		str_value = std::stoi(line);
+		ranks[i] = str_value;
+		localRanks[i] = i;
+		i++;
+		if(i == mmersNumber) break;
+	}
+	std::sort(localRanks, localRanks + mmersNumber, CompR(ranks));
+	for(uint32 j = 0; j < mmersNumber; ++j)
+	{
+		// std::cout << " j is = " << j << " val is " << localRanks[j] << std::endl;
+		ranks[localRanks[j]] = j;
+	}
+	infile.close();
+}
+
+void gerbil::SequenceSplitter::loadFrequency(uint32* freq)
+{
+	uint32 mmersNumber = 1<<(2*_m);
+	std::ifstream infile("freq.txt");
+	int str_value;
+	std::string line;
+	uint32 i = 0;
+	while (std::getline(infile, line))
+	{
+		str_value = std::stoi(line);
+		freq[i] = str_value;
+		i++;
+		if(i == mmersNumber) break;
+	}
+	infile.close();
+}
+
+
 void gerbil::SequenceSplitter::detMMerHisto() {
 	const uint32 mMersNumber = 1 << (2 * _m);
+	uint32 stats[mMersNumber];
 
-	// kmc2 strategy
-	std::vector<std::pair<uint32_t,uint32_t>> kMerFrequencies;
-	for(uint32 mmer = 0; mmer < mMersNumber; ++mmer)
-		kMerFrequencies.push_back(std::make_pair(isAllowed(mmer) ? mmer : 0xffffffffu, mmer));
+	loadRanks(_mVal);	
+	loadFrequency(stats);
 
-	std::sort(kMerFrequencies.begin(), kMerFrequencies.end());
-	uint32 rank = 0;
-	for (std::vector<std::pair<uint32_t,uint32_t>>::iterator it = kMerFrequencies.begin() ; it != kMerFrequencies.end(); ++it) {
-		_mVal[it->second] = rank++;
+
+	uint32 local_sorted[mMersNumber];
+	uint32 *sorted = local_sorted;
+	for (uint32 i = 0; i < mMersNumber ; ++i)
+		sorted[i] = i;
+	std::sort(sorted, sorted + mMersNumber, Comp(stats));
+
+	std::list<std::pair<uint32, uint64>> _stats;
+
+	for (uint32 i = 0; i < mMersNumber ; ++i)
+	{
+		if(i < invMMer(i))
+		{
+			_stats.push_back(std::make_pair(sorted[i], stats[sorted[i]]));
+		}
+		// if want without normalization, add non canonical mmers too.
 	}
 
-	// pyramid-shaped distribution
-	uint32 bfnx2 = 2 * _tempFilesNumber;
-	uint32 mMN = mMersNumber - mMersNumber % bfnx2;
-	int32 p = mMN / bfnx2;
-	for(uint32 i = 0; i < mMersNumber; ++i)
-		if(_mVal[i] < mMN){
-			int32 d = _mVal[i] / bfnx2;
-			int32 m = (_mVal[i] + d * bfnx2 / p) % bfnx2;
-			int32 x = m - (int32)_tempFilesNumber;
-			_mToBin[i] = x < 0 ? -x - 1 : x;
+	std::list<uint32> _stats_zero_ids;
+	for (auto it = _stats.begin(); it != _stats.end();)
+	{
+		if (it->second == 0)
+		{
+			_stats_zero_ids.push_back(it->first);
+			it = _stats.erase(it);
 		}
 		else
-			_mToBin[i] = _tempFilesNumber - 1 - (_mVal[i] % _tempFilesNumber);
+			++it;
+	}
+	uint32 total_zeroes = _stats_zero_ids.size();
+	uint32 assigned_zeros = 0;
+	
+
+	std::list<std::pair<uint32, uint64>> group;
+	uint32 bin_no = 0;
+	//counting sum
+	double sum = 0.0;
+	for (auto &i : _stats)
+	{
+		// i.second += 100;
+		sum += i.second;
+	}
+
+
+	double mean = sum / _tempFilesNumber;
+	double max_bin_size = _stats.front().second; // minimizer with largest load is alone in a bin
+	uint32 n = _tempFilesNumber; 
+	uint32 max_bins = _tempFilesNumber;
+	uint32 num_zeros_in_bin = (_stats_zero_ids.size() / max_bins) + 1;
+
+	while (_stats.size() > n)
+	{
+		std::pair<uint32, uint64>& max = _stats.front();
+
+		if (max.second >= max_bin_size)
+		{
+			// std::cout << max.first << " innn " << bin_no <<std::endl << std::flush;
+			_mToBin[max.first] = bin_no++;
+			sum -= max.second;
+			mean = sum / (max_bins - bin_no);
+			max_bin_size =  max_bin_size = mean; // max_bin_size > mean ? max_bin_size : mean; 
+
+			_stats.pop_front();
+			--n;
+		}
+		else	
+		{
+			//heuristic
+			group.clear();
+			double tmp_sum = 0.0;
+			uint32 in_current = 0;
+			for (auto it = _stats.begin(); it != _stats.end();)
+			{
+				if (tmp_sum + it->second <= max_bin_size)
+				{
+					tmp_sum += it->second;
+					group.push_back(*it);
+					it = _stats.erase(it);
+					++in_current;
+				}
+				else
+					++it;
+			}
+			for (auto i = group.begin(); i != group.end(); ++i)
+			{
+				//std::cout << i->first << " in " << bin_no <<std::endl << std::flush;
+				_mToBin[i->first] = bin_no;
+			}
+
+			for (auto p = std::make_pair(_stats_zero_ids.begin(),0);
+			 	p.first != _stats_zero_ids.end() && p.second < num_zeros_in_bin && assigned_zeros < total_zeroes;
+			  	++p.second, ++assigned_zeros)
+			{
+				_mToBin[*(p.first)] = bin_no;
+				p.first = _stats_zero_ids.erase(p.first);
+			}
+			--n;
+			++bin_no;
+
+			sum -= tmp_sum;
+			mean = sum / (max_bins - bin_no);
+			max_bin_size = 1.1 * mean;
+		}
+	}
+	if (_stats.size() > 0)
+	{
+		for (auto i = _stats.begin(); i != _stats.end(); ++i)
+		{
+			_mToBin[i->first] = _tempFilesNumber - 1 - (i->first%_tempFilesNumber);
+		}
+	}
+	if(_stats_zero_ids.size() > 0)
+	{
+		// for (auto i = _stats_zero_ids.begin(); i != _stats_zero_ids.end(); ++i)
+		// {
+		// 	_mToBin[*i] = _tempFilesNumber - 1 - ((*i)%_tempFilesNumber);
+		// }
+
+		for (auto it = _stats_zero_ids.begin(); it != _stats_zero_ids.end();)
+		{
+			_mToBin[*it] = _tempFilesNumber - 1 - ((*it)%_tempFilesNumber);
+			it = _stats_zero_ids.erase(it);
+		}
+		if(_stats_zero_ids.size() == 0)
+		{
+		std::cout << "No elements in zero sized " << std::endl;
+		}
+	}
+
 }
 
 void gerbil::SequenceSplitter::process() {
